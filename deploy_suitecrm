@@ -1,0 +1,205 @@
+#!/bin/bash
+set -e # Exit immediately if a command exits with a non-zero status.
+
+# --- SCRIPT CONFIGURATION ---
+# IMPORTANT: REPLACE ALL PLACEHOLDER VALUES BELOW WITH YOUR ACTUAL CREDENTIALS AND DETAILS.
+# GENERATE STRONG, UNIQUE PASSWORDS FOR EACH.
+
+# Your Application Load Balancer's DNS Name (e.g., http://your-alb-name.region.elb.amazonaws.com)
+# Ensure this matches the listener protocol (http or https)
+ALB_DNS_NAME="http://YOUR_ALB_DNS_NAME_HERE"
+
+# MariaDB Root Password (used for 'mysql_secure_installation' and initial DB login)
+# You will enter this manually when prompted by 'mysql_secure_installation'
+# Example: "MyStrongDBRootPass123!"
+DB_ROOT_PASSWORD="YOUR_MARIADB_ROOT_PASSWORD_HERE"
+
+# SuiteCRM Database Credentials
+SUITECRM_DB_NAME="suitecrm_db"
+SUITECRM_DB_USER="suitecrm_user"
+SUITECRM_DB_PASSWORD="YOUR_SUITECRM_DB_PASSWORD_HERE" # Strong password for SuiteCRM's database user
+
+# SuiteCRM Application Admin Credentials (for logging into the SuiteCRM web interface)
+SUITECRM_ADMIN_USER="admin"
+SUITECRM_ADMIN_PASSWORD="YOUR_SUITECRM_ADMIN_PASSWORD_HERE" # Strong password for SuiteCRM app admin
+
+# SuiteCRM Download Details
+# IMPORTANT: ALWAYS VERIFY THE LATEST STABLE VERSION AND URL FROM https://suitecrm.com/download/
+# For SuiteCRM 8.8.0, the GitHub release URL is generally stable.
+SUITECRM_VERSION="8.8.0"
+SUITECRM_ZIP_URL="https://github.com/salesagility/SuiteCRM-Core/releases/download/v${SUITECRM_VERSION}/SuiteCRM-${SUITECRM_VERSION}.zip"
+SUITECRM_ZIP_FILENAME="SuiteCRM-${SUITECRM_VERSION}.zip"
+SUITECRM_EXTRACT_DIR="/var/www/html/suitecrm"
+WEB_SERVER_USER="www-data" # Default Apache user on Ubuntu
+
+echo "--- Starting SuiteCRM ${SUITECRM_VERSION} Deployment Script ---"
+echo "ALB DNS: $ALB_DNS_NAME"
+echo "Database: $SUITECRM_DB_NAME, User: $SUITECRM_DB_USER"
+echo "SuiteCRM Admin User: $SUITECRM_ADMIN_USER"
+echo "----------------------------------------------------"
+
+# --- Pre-flight Checks ---
+echo "Performing pre-flight checks..."
+if ! command -v php &> /dev/null; then
+    echo "PHP is not installed or not in PATH. Please ensure PHP is installed before running this script."
+    exit 1
+fi
+if ! command -v mariadb &> /dev/null && ! command -v mysql &> /dev/null; then
+    echo "MariaDB/MySQL client is not installed. Please ensure MariaDB/MySQL is installed before running this script."
+    exit 1
+fi
+echo "Pre-flight checks passed."
+
+# --- 1. Update System & Install LAMP Stack Components ---
+echo "[1/7] Updating system and installing LAMP stack components..."
+
+sudo apt update -y
+sudo apt upgrade -y
+
+# Install Apache2
+sudo apt install -y apache2
+
+# Install PHP 8.3 and required extensions (excluding php8.3-json as it's often built-in)
+sudo apt install -y php8.3 libapache2-mod-php8.3 php8.3-cli php8.3-common php8.3-curl php8.3-gd php8.3-intl php8.3-mbstring php8.3-mysql php8.3-soap php8.3-xml php8.3-zip php8.3-bcmath php8.3-opcache
+
+# Install MariaDB Server
+sudo apt install -y mariadb-server mariadb-client
+
+echo "[1/7] LAMP stack installation complete."
+
+# --- 2. Secure MariaDB and Create SuiteCRM Database/User (MANUAL STEPS ASSUMED DONE) ---
+echo "[2/7] Assuming MariaDB security setup and database/user creation are COMPLETE."
+echo "      (You should have manually run 'sudo mysql_secure_installation' and then"
+echo "      logged into MariaDB to create the database '$SUITECRM_DB_NAME' and user '$SUITECRM_DB_USER')"
+echo "      with password '$SUITECRM_DB_PASSWORD'."
+
+# --- 3. Download and Extract SuiteCRM ---
+echo "[3/7] Downloading and extracting SuiteCRM..."
+
+sudo mkdir -p "$SUITECRM_EXTRACT_DIR"
+cd "$SUITECRM_EXTRACT_DIR" || { echo "ERROR: Failed to change directory to $SUITECRM_EXTRACT_DIR"; exit 1; }
+
+echo "Downloading $SUITECRM_ZIP_FILENAME from $SUITECRM_ZIP_URL..."
+sudo wget "$SUITECRM_ZIP_URL" -O "$SUITECRM_ZIP_FILENAME"
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to download SuiteCRM from $SUITECRM_ZIP_URL. Please check the URL and your internet connectivity."
+    exit 1
+fi
+
+echo "Extracting $SUITECRM_ZIP_FILENAME..."
+sudo apt install -y unzip # Ensure unzip is installed
+sudo unzip "$SUITECRM_ZIP_FILENAME" -d "$SUITECRM_EXTRACT_DIR"
+
+# Adjust extraction path if unzip creates an extra directory layer like "SuiteCRM-8.8.0"
+# This is a common behavior of unzip
+if [ -d "$SUITECRM_EXTRACT_DIR/SuiteCRM-${SUITECRM_VERSION}" ]; then
+    echo "Adjusting extracted directory structure: Moving contents from SuiteCRM-${SUITECRM_VERSION}..."
+    sudo mv "$SUITECRM_EXTRACT_DIR/SuiteCRM-${SUITECRM_VERSION}"/* "$SUITECRM_EXTRACT_DIR"/
+    sudo rm -r "$SUITECRM_EXTRACT_DIR/SuiteCRM-${SUITECRM_VERSION}"
+fi
+
+sudo rm "$SUITECRM_ZIP_FILENAME" # Clean up the downloaded zip file
+
+sudo chown -R "$WEB_SERVER_USER":"$WEB_SERVER_USER" "$SUITECRM_EXTRACT_DIR"
+
+echo "[3/7] SuiteCRM download and extraction complete."
+
+# --- 4. Configure Apache for SuiteCRM ---
+echo "[4/7] Configuring Apache..."
+
+# Disable default site and remove old index.html
+sudo a2dissite 000-default.conf 2>/dev/null || true # Suppress error if already disabled
+sudo rm /var/www/html/index.html 2>/dev/null || true # Suppress error if file doesn't exist
+sudo rm /var/www/html/info.php 2>/dev/null || true # Remove any lingering info.php
+
+# Create Apache Virtual Host configuration
+echo "Creating Apache Virtual Host configuration for SuiteCRM..."
+sudo tee /etc/apache2/sites-available/suitecrm.conf > /dev/null <<EOF
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    ServerName ${ALB_DNS_NAME/http:\/\//} # Extracts domain from URL
+    DocumentRoot $SUITECRM_EXTRACT_DIR/public
+
+    <Directory $SUITECRM_EXTRACT_DIR/public>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog \${APACHE_LOG_DIR}/error.log
+    CustomLog \${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+EOF
+
+# Enable SuiteCRM site and rewrite module
+echo "Enabling SuiteCRM Apache site and rewrite module..."
+sudo a2ensite suitecrm.conf
+sudo a2enmod rewrite
+
+# Restart Apache to apply changes
+echo "Restarting Apache..."
+sudo systemctl restart apache2
+
+echo "[4/7] Apache configuration complete."
+
+# --- 5. Run SuiteCRM CLI Installer ---
+echo "[5/7] Running SuiteCRM CLI Installer (this may take a few minutes)..."
+
+cd "$SUITECRM_EXTRACT_DIR" || { echo "ERROR: Failed to change directory to $SUITECRM_EXTRACT_DIR"; exit 1; }
+
+# Execute the CLI installer using the web server user
+sudo -u "$WEB_SERVER_USER" /usr/bin/php ./bin/console suitecrm:app:install \
+-u "$SUITECRM_ADMIN_USER" \
+-p "$SUITECRM_ADMIN_PASSWORD" \
+-U "$SUITECRM_DB_USER" \
+-P "$SUITECRM_DB_PASSWORD" \
+-H "localhost" \
+-N "$SUITECRM_DB_NAME" \
+-S "$ALB_DNS_NAME" \
+-d "yes" \
+--sys_check_option "true"
+
+echo "[5/7] SuiteCRM CLI installation complete."
+
+# --- 6. Set File Permissions (Post-Install) ---
+echo "[6/7] Setting file permissions (post-install)..."
+
+sudo find "$SUITECRM_EXTRACT_DIR" -type d -not -perm 2755 -exec chmod 2755 {} \;
+sudo find "$SUITECRM_EXTRACT_DIR" -type f -not -perm 0644 -exec chmod 0644 {} \;
+sudo find "$SUITECRM_EXTRACT_DIR" ! -user "$WEB_SERVER_USER" -exec chown "$WEB_SERVER_USER":"$WEB_SERVER_USER" {} \;
+sudo chmod +x "$SUITECRM_EXTRACT_DIR"/bin/console
+
+echo "[6/7] File permissions set."
+
+# --- 7. Double-Check Configurations (.htaccess) ---
+echo "[7/7] Adjusting .htaccess for RewriteBase /legacy..."
+
+# Use sed to ensure RewriteBase /legacy is correctly set in .htaccess
+# This handles cases where it's missing or incorrect.
+HTACCESS_FILE="$SUITECRM_EXTRACT_DIR/public/legacy/.htaccess"
+if [ -f "$HTACCESS_FILE" ]; then
+    if ! grep -q "RewriteBase /legacy" "$HTACCESS_FILE"; then
+        echo "Adding/Correcting 'RewriteBase /legacy' in .htaccess..."
+        # Remove existing RewriteBase lines if any, then add the correct one after RewriteEngine On
+        sudo sed -i '/RewriteBase/d' "$HTACCESS_FILE"
+        sudo sed -i '/RewriteEngine On/aRewriteBase /legacy' "$HTACCESS_FILE"
+    else
+        echo "'RewriteBase /legacy' already correctly set in .htaccess."
+    fi
+else
+    echo "WARNING: .htaccess file not found at $HTACCESS_FILE. This may cause issues."
+fi
+
+echo "--------------------------------------------------------------------------"
+echo "--- DEPLOYMENT COMPLETE ---"
+echo "--------------------------------------------------------------------------"
+echo ""
+echo "SuiteCRM ${SUITECRM_VERSION} has been deployed!"
+echo "You should now be able to access your SuiteCRM instance at:"
+echo "$ALB_DNS_NAME"
+echo ""
+echo "Login with Admin Username: $SUITECRM_ADMIN_USER"
+echo "Login with Admin Password: $SUITECRM_ADMIN_PASSWORD"
+echo ""
+echo "IMPORTANT: You may want to reboot the EC2 instance later if a kernel update was pending."
+echo "--------------------------------------------------------------------------"
